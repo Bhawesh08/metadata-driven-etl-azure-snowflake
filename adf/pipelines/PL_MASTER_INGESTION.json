@@ -1,0 +1,730 @@
+{
+    "name": "PL_CHILD_INGESTION",
+    "properties": {
+        "description": "Processes single table end to end\nCDC extract → ADLS → DQ → Snowflake",
+        "activities": [
+            {
+                "name": "SP_LogPipelineStart",
+                "type": "SqlServerStoredProcedure",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "storedProcedureName": "[dbo].[usp_log_pipeline_start]",
+                    "storedProcedureParameters": {
+                        "adf_pipeline": {
+                            "value": {
+                                "value": "@pipeline().Pipeline",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "adf_run_id": {
+                            "value": {
+                                "value": "@pipeline().RunId",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "adf_trigger": {
+                            "value": {
+                                "value": "@pipeline().TriggerName",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "pipeline_name": {
+                            "value": {
+                                "value": "@pipeline().parameters.pipeline_name",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "source_table": {
+                            "value": {
+                                "value": "@pipeline().parameters.source_table",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        }
+                    }
+                },
+                "linkedServiceName": {
+                    "referenceName": "LS_AzureSQL_MetadataDB",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "LKP_GetWatermark",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "SP_LogPipelineStart",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": {
+                            "value": "@concat(\n  'SELECT\n     ISNULL(last_watermark_value, ''1900-01-01 00:00:00'') AS watermark_value,\n     ISNULL(last_watermark_datetime, ''1900-01-01'') AS watermark_datetime,\n     initial_load_done\n   FROM dbo.cdc_watermark\n   WHERE pipeline_name = ''',\n   pipeline().parameters.pipeline_name,\n   ''''\n)",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "dataset": {
+                        "referenceName": "DS_AzureSQL_MetadataDB",
+                        "type": "DatasetReference"
+                    }
+                }
+            },
+            {
+                "name": "Set_WatermarkValue",
+                "type": "SetVariable",
+                "dependsOn": [
+                    {
+                        "activity": "LKP_GetWatermark",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "variableName": "watermark_value",
+                    "value": {
+                        "value": "@activity('LKP_GetWatermark').output.firstRow.watermark_value",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "Set_ADLSPath",
+                "type": "SetVariable",
+                "dependsOn": [
+                    {
+                        "activity": "Set_WatermarkValue",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "variableName": "adls_full_path",
+                    "value": {
+                        "value": "@concat(\n  pipeline().parameters.adls_folder_path,\n  formatDateTime(utcNow(), 'yyyy/MM/dd'),\n  '/'\n)",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "CPY_SourceToADLS",
+                "type": "Copy",
+                "dependsOn": [
+                    {
+                        "activity": "Set_ADLSPath",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": {
+                            "value": "@if(\n  equals(pipeline().parameters.load_type, 'FULL'),\n  concat(\n    'SELECT * FROM ',\n    pipeline().parameters.source_schema, '.',\n    pipeline().parameters.source_table\n  ),\n  concat(\n    'SELECT * FROM ',\n    pipeline().parameters.source_schema, '.',\n    pipeline().parameters.source_table,\n    ' WHERE ',\n    pipeline().parameters.cdc_column,\n    ' >= ''', variables('watermark_value'), ''''\n  )\n)",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "sink": {
+                        "type": "ParquetSink",
+                        "storeSettings": {
+                            "type": "AzureBlobFSWriteSettings",
+                            "copyBehavior": "PreserveHierarchy"
+                        },
+                        "formatSettings": {
+                            "type": "ParquetWriteSettings"
+                        }
+                    },
+                    "enableStaging": false,
+                    "enableSkipIncompatibleRow": true,
+                    "logSettings": {
+                        "enableCopyActivityLog": true,
+                        "copyActivityLogSettings": {
+                            "logLevel": "Warning",
+                            "enableReliableLogging": false
+                        },
+                        "logLocationSettings": {
+                            "linkedServiceName": {
+                                "referenceName": "LS_ADLS_LandingZone",
+                                "type": "LinkedServiceReference"
+                            }
+                        }
+                    },
+                    "translator": {
+                        "type": "TabularTranslator",
+                        "typeConversion": true,
+                        "typeConversionSettings": {
+                            "allowDataTruncation": true,
+                            "treatBooleanAsNumber": false
+                        }
+                    }
+                },
+                "inputs": [
+                    {
+                        "referenceName": "DS_AzureSQL_Source",
+                        "type": "DatasetReference"
+                    }
+                ],
+                "outputs": [
+                    {
+                        "referenceName": "DS_ADLS_Parquet_Sink",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "container": {
+                                "value": "@pipeline().parameters.adls_container",
+                                "type": "Expression"
+                            },
+                            "directory": {
+                                "value": "@concat(pipeline().parameters.adls_folder_path, formatDateTime(utcNow(),'yyyy/MM/dd'))",
+                                "type": "Expression"
+                            },
+                            "fileName": {
+                                "value": "@concat(\n              pipeline().parameters.source_table,\n              '_',\n              formatDateTime(utcNow(),'yyyyMMdd'),\n              '.parquet'\n            )",
+                                "type": "Expression"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "name": "SCR_MergeToStaging",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "SCR_LoadSnowflakeRAW",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "linkedServiceName": {
+                    "referenceName": "LS_Snowflake",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "parameters": [
+                                {
+                                    "name": "BATCH_ID",
+                                    "type": "String",
+                                    "value": {
+                                        "value": "@pipeline().parameters.batch_id",
+                                        "type": "Expression"
+                                    },
+                                    "direction": "Input"
+                                },
+                                {
+                                    "name": "RUN_ID",
+                                    "type": "String",
+                                    "value": {
+                                        "value": "@pipeline().RunId",
+                                        "type": "Expression"
+                                    },
+                                    "direction": "Input"
+                                },
+                                {
+                                    "name": "PIPELINE_NAME",
+                                    "type": "String",
+                                    "value": {
+                                        "value": "@pipeline().parameters.pipeline_name",
+                                        "type": "Expression"
+                                    },
+                                    "direction": "Input"
+                                }
+                            ],
+                            "type": "Query",
+                            "text": {
+                                "value": "@concat(\n    'CALL SUPPLY_CHAIN_DB.STAGING.MERGE_',\n    toUpper(pipeline().parameters.source_table),\n    '(''',\n    pipeline().parameters.batch_id,\n    ''',''',\n    pipeline().RunId,\n    ''',''',\n    pipeline().parameters.pipeline_name,\n    ''');'\n)",
+                                "type": "Expression"
+                            }
+                        }
+                    ],
+                    "scriptBlockExecutionTimeout": "02:00:00",
+                    "treatDecimalAsString": false
+                }
+            },
+            {
+                "name": "SP_UpdateWatermark",
+                "type": "SqlServerStoredProcedure",
+                "dependsOn": [
+                    {
+                        "activity": "SCR_MergeToStaging",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "storedProcedureName": "[dbo].[usp_update_watermark]",
+                    "storedProcedureParameters": {
+                        "new_watermark": {
+                            "value": {
+                                "value": "@formatDateTime(utcNow(),'yyyy-MM-dd HH:mm:ss')",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "pipeline_name": {
+                            "value": {
+                                "value": "@pipeline().parameters.pipeline_name",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "rows_loaded": {
+                            "value": {
+                                "value": "@activity('CPY_SourceToADLS').output.rowsCopied",
+                                "type": "Expression"
+                            },
+                            "type": "Int32"
+                        },
+                        "source_table": {
+                            "value": {
+                                "value": "@pipeline().parameters.source_table",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        }
+                    }
+                },
+                "linkedServiceName": {
+                    "referenceName": "LS_AzureSQL_MetadataDB",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "SP_LogPipelineSuccess",
+                "type": "SqlServerStoredProcedure",
+                "dependsOn": [
+                    {
+                        "activity": "SP_UpdateWatermark",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "storedProcedureName": "[dbo].[usp_log_pipeline_end]",
+                    "storedProcedureParameters": {
+                        "adf_run_id": {
+                            "value": {
+                                "value": "@pipeline().RunId",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "error_message": {
+                            "value": {
+                                "value": "@if(\n   equals(activity('CPY_SourceToADLS').Status,'Failed'),\n   activity('CPY_SourceToADLS').error.message,\n   'SUCCESS'\n)",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "pipeline_name": {
+                            "value": {
+                                "value": "@pipeline().parameters.pipeline_name",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "rows_extracted": {
+                            "value": {
+                                "value": "@activity('CPY_SourceToADLS').output.rowsCopied",
+                                "type": "Expression"
+                            },
+                            "type": "Int32"
+                        },
+                        "rows_loaded": {
+                            "value": {
+                                "value": "@activity('CPY_SourceToADLS').output.rowsCopied",
+                                "type": "Expression"
+                            },
+                            "type": "Int32"
+                        },
+                        "status": {
+                            "value": {
+                                "value": "SUCCESS",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        }
+                    }
+                },
+                "linkedServiceName": {
+                    "referenceName": "LS_AzureSQL_MetadataDB",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "SP_LogPipelineFailure",
+                "type": "SqlServerStoredProcedure",
+                "dependsOn": [
+                    {
+                        "activity": "SP_UpdateWatermark",
+                        "dependencyConditions": [
+                            "Failed"
+                        ]
+                    },
+                    {
+                        "activity": "SCR_MergeToStaging",
+                        "dependencyConditions": [
+                            "Failed"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "storedProcedureName": "[dbo].[usp_log_pipeline_end]",
+                    "storedProcedureParameters": {
+                        "adf_run_id": {
+                            "value": {
+                                "value": "@pipeline().RunId",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "error_message": {
+                            "value": {
+                                "value": "@activity('CPY_SourceToADLS').error.message",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "pipeline_name": {
+                            "value": {
+                                "value": "@pipeline().parameters.pipeline_name",
+                                "type": "Expression"
+                            },
+                            "type": "String"
+                        },
+                        "rows_extracted": {
+                            "value": "0",
+                            "type": "Int32"
+                        },
+                        "rows_loaded": {
+                            "value": "0",
+                            "type": "Int32"
+                        },
+                        "status": {
+                            "value": "FAILED",
+                            "type": "String"
+                        }
+                    }
+                },
+                "linkedServiceName": {
+                    "referenceName": "LS_AzureSQL_MetadataDB",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "SCR_LoadSnowflakeRAW",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "Truncate Raw table",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "linkedServiceName": {
+                    "referenceName": "LS_Snowflake",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "type": "Query",
+                            "text": {
+                                "value": "@concat(\n  'COPY INTO ', pipeline().parameters.sink_schema, '.', pipeline().parameters.sink_table,\n  ' (', variables('var_ColumnList'), ',_PIPELINE_NAME,_BATCH_ID,_RUN_ID,_LOAD_TYPE,_SOURCE_FILE)',\n  ' FROM (SELECT ', variables('var_ColumnSelectList'), ',',\n  '''', pipeline().parameters.pipeline_name, ''' AS _PIPELINE_NAME,',\n  '''', pipeline().parameters.batch_id, ''' AS _BATCH_ID,',\n  '''', pipeline().RunId, ''' AS _RUN_ID,',\n  '''', pipeline().parameters.load_type, ''' AS _LOAD_TYPE,',\n  'METADATA$FILENAME AS _SOURCE_FILE',\n  ' FROM @SUPPLY_CHAIN_DB.RAW.ADLS_STAGE/',\n  variables('adls_full_path'),\n  pipeline().parameters.source_table,\n  '_',\n  formatDateTime(utcNow(),'yyyyMMdd'),\n  '.parquet',\n  ') FILE_FORMAT = (TYPE = PARQUET) ON_ERROR = CONTINUE'\n)",
+                                "type": "Expression"
+                            }
+                        }
+                    ],
+                    "scriptBlockExecutionTimeout": "02:00:00",
+                    "treatDecimalAsString": false
+                }
+            },
+            {
+                "name": "Truncate Raw table",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "SV_ColumnSelectList",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "linkedServiceName": {
+                    "referenceName": "LS_Snowflake",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "type": "Query",
+                            "text": {
+                                "value": "TRUNCATE TABLE RAW.@{pipeline().parameters.sink_table}",
+                                "type": "Expression"
+                            }
+                        }
+                    ],
+                    "scriptBlockExecutionTimeout": "02:00:00",
+                    "treatDecimalAsString": false
+                }
+            },
+            {
+                "name": "LU_GetSnowflakeColumns",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "CPY_SourceToADLS",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "SnowflakeV2Source",
+                        "query": {
+                            "value": "@concat(\n  'SELECT ',\n  'LISTAGG(''$1:\"'' || LOWER(COLUMN_NAME) || ''\"::'' || ',\n  'CASE DATA_TYPE ',\n  'WHEN ''TEXT'' THEN ''VARCHAR'' ',\n  'WHEN ''NUMBER'' THEN ''NUMBER'' ',\n  'WHEN ''FLOAT'' THEN ''FLOAT'' ',\n  'WHEN ''BOOLEAN'' THEN ''BOOLEAN'' ',\n  'WHEN ''DATE'' THEN ''DATE'' ',\n  'WHEN ''TIMESTAMP_NTZ'' THEN ''TIMESTAMP'' ',\n  'WHEN ''TIMESTAMP_LTZ'' THEN ''TIMESTAMP'' ',\n  'WHEN ''TIMESTAMP_TZ'' THEN ''TIMESTAMP'' ',\n  'ELSE ''VARCHAR'' END, '','') ',\n  'WITHIN GROUP (ORDER BY ORDINAL_POSITION) AS COLUMN_SELECT_LIST, ',\n  'LISTAGG(COLUMN_NAME, '','') ',\n  'WITHIN GROUP (ORDER BY ORDINAL_POSITION) AS COLUMN_LIST ',\n  'FROM INFORMATION_SCHEMA.COLUMNS ',\n  'WHERE TABLE_SCHEMA = ''', pipeline().parameters.sink_schema, ''' ',\n  'AND TABLE_NAME = ''', toUpper(pipeline().parameters.sink_table), ''' ',\n  'AND COLUMN_NAME NOT IN (''_PIPELINE_NAME'',''_BATCH_ID'',''_RUN_ID'',''_LOAD_TYPE'',''_SOURCE_FILE'')'\n)",
+                            "type": "Expression"
+                        },
+                        "exportSettings": {
+                            "type": "SnowflakeExportCopyCommand"
+                        },
+                        "treatDecimalAsString": false
+                    },
+                    "dataset": {
+                        "referenceName": "DS_Snowflake_Query",
+                        "type": "DatasetReference"
+                    },
+                    "firstRowOnly": true
+                }
+            },
+            {
+                "name": "SV_ColumnList",
+                "type": "SetVariable",
+                "dependsOn": [
+                    {
+                        "activity": "LU_GetSnowflakeColumns",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "variableName": "var_ColumnList",
+                    "value": {
+                        "value": "@activity('LU_GetSnowflakeColumns').output.firstRow.COLUMN_LIST",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "SV_ColumnSelectList",
+                "type": "SetVariable",
+                "dependsOn": [
+                    {
+                        "activity": "SV_ColumnList",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "variableName": "var_ColumnSelectList",
+                    "value": {
+                        "value": "@activity('LU_GetSnowflakeColumns').output.firstRow.COLUMN_SELECT_LIST",
+                        "type": "Expression"
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "pipeline_name": {
+                "type": "string"
+            },
+            "source_type": {
+                "type": "string"
+            },
+            "source_server": {
+                "type": "string"
+            },
+            "source_database": {
+                "type": "string"
+            },
+            "source_schema": {
+                "type": "string"
+            },
+            "source_table": {
+                "type": "string"
+            },
+            "load_type": {
+                "type": "string"
+            },
+            "cdc_column": {
+                "type": "string"
+            },
+            "primary_key_columns": {
+                "type": "string"
+            },
+            "sink_schema": {
+                "type": "string"
+            },
+            "sink_table": {
+                "type": "string"
+            },
+            "adls_container": {
+                "type": "string"
+            },
+            "adls_folder_path": {
+                "type": "string"
+            },
+            "dq_enabled": {
+                "type": "string"
+            },
+            "batch_id": {
+                "type": "string"
+            }
+        },
+        "variables": {
+            "watermark_value": {
+                "type": "String"
+            },
+            "run_id": {
+                "type": "String"
+            },
+            "adls_full_path": {
+                "type": "String"
+            },
+            "extract_query": {
+                "type": "String"
+            },
+            "var_ColumnList": {
+                "type": "String"
+            },
+            "var_ColumnSelectList": {
+                "type": "String"
+            }
+        },
+        "annotations": [],
+        "lastPublishTime": "2026-03-18T23:16:44Z"
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}
