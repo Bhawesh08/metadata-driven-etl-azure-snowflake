@@ -1,0 +1,173 @@
+{
+    "name": "PL_MASTER_INGESTION",
+    "properties": {
+        "description": "1.Master orchestration pipeline\n2.Reads all active configs\n3.Loops and calls child pipeline",
+        "activities": [
+            {
+                "name": "Set_BatchID",
+                "type": "SetVariable",
+                "dependsOn": [],
+                "policy": {
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "variableName": "batch_id",
+                    "value": {
+                        "value": "@concat(\n  'BATCH-',\n  formatDateTime(utcNow(), 'yyyyMMdd-HHmmss')\n)",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "LKP_GetActivePipelines",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "Set_BatchID",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": {
+                            "value": "SELECT\n    pipeline_id,\n    pipeline_name,\n    source_type,\n    source_server,\n    source_database,\n    source_schema,\n    source_table,\n    source_query,\n    load_type,\n    cdc_column,\n    cdc_column_type,\n    primary_key_columns,\n    sink_schema,\n    sink_table,\n    adls_container,\n    adls_folder_path,\n    file_format,\n    batch_size,\n    dq_enabled,\n    retry_count\nFROM dbo.pipeline_config\nWHERE is_active = 1\nORDER BY pipeline_id",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "02:00:00",
+                        "partitionOption": "None"
+                    },
+                    "dataset": {
+                        "referenceName": "DS_AzureSQL_MetadataDB",
+                        "type": "DatasetReference"
+                    },
+                    "firstRowOnly": false
+                }
+            },
+            {
+                "name": "FE_LoopPipelines",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "LKP_GetActivePipelines",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "userProperties": [],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('LKP_GetActivePipelines').output.value",
+                        "type": "Expression"
+                    },
+                    "isSequential": false,
+                    "batchCount": 3,
+                    "activities": [
+                        {
+                            "name": "EP_RunChildIngestion",
+                            "type": "ExecutePipeline",
+                            "dependsOn": [],
+                            "policy": {
+                                "secureInput": false
+                            },
+                            "userProperties": [],
+                            "typeProperties": {
+                                "pipeline": {
+                                    "referenceName": "PL_CHILD_INGESTION",
+                                    "type": "PipelineReference"
+                                },
+                                "waitOnCompletion": true,
+                                "parameters": {
+                                    "pipeline_name": {
+                                        "value": "@item().pipeline_name",
+                                        "type": "Expression"
+                                    },
+                                    "source_type": {
+                                        "value": "@item().source_type",
+                                        "type": "Expression"
+                                    },
+                                    "source_server": {
+                                        "value": "@item().source_server",
+                                        "type": "Expression"
+                                    },
+                                    "source_database": {
+                                        "value": "@item().source_database",
+                                        "type": "Expression"
+                                    },
+                                    "source_schema": {
+                                        "value": "@item().source_schema",
+                                        "type": "Expression"
+                                    },
+                                    "source_table": {
+                                        "value": "@item().source_table",
+                                        "type": "Expression"
+                                    },
+                                    "load_type": {
+                                        "value": "@item().load_type",
+                                        "type": "Expression"
+                                    },
+                                    "cdc_column": {
+                                        "value": "@item().cdc_column",
+                                        "type": "Expression"
+                                    },
+                                    "primary_key_columns": {
+                                        "value": "@item().primary_key_columns",
+                                        "type": "Expression"
+                                    },
+                                    "sink_schema": {
+                                        "value": "@item().sink_schema",
+                                        "type": "Expression"
+                                    },
+                                    "sink_table": {
+                                        "value": "@item().sink_table",
+                                        "type": "Expression"
+                                    },
+                                    "adls_container": {
+                                        "value": "@item().adls_container",
+                                        "type": "Expression"
+                                    },
+                                    "adls_folder_path": {
+                                        "value": "@item().adls_folder_path",
+                                        "type": "Expression"
+                                    },
+                                    "dq_enabled": {
+                                        "value": "@item().dq_enabled",
+                                        "type": "Expression"
+                                    },
+                                    "batch_id": {
+                                        "value": "@variables('batch_id')",
+                                        "type": "Expression"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "variables": {
+            "batch_id": {
+                "type": "String"
+            },
+            "pipeline_run_id": {
+                "type": "String"
+            }
+        },
+        "annotations": [],
+        "lastPublishTime": "2026-03-18T01:25:37Z"
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}
