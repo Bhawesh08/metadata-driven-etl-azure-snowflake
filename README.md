@@ -10,6 +10,7 @@
 > **Pattern:** Metadata-Driven · CDC Watermarking · ELT · Medallion Architecture
 
 ---
+<img width="1747" height="712" alt="image" src="https://github.com/user-attachments/assets/4ddd2cfe-d247-443e-b8ac-e3d9ba845377" />
 
 ##  Project Overview
 
